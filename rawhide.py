@@ -9,6 +9,16 @@ import sys
 import threading
 import gc
 
+# If running with the system Python (e.g. `python3 rawhide.py` directly),
+# the venv packages won't be on sys.path. Re-exec with the venv Python if
+# it exists so rawpy/Pillow/numpy are available.
+_VENV_PYTHON = "/usr/local/share/rawhide/venv/bin/python3"
+if (
+    os.path.isfile(_VENV_PYTHON)
+    and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PYTHON)
+):
+    os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
+
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
