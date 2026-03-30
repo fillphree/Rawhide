@@ -82,7 +82,9 @@ def load_image_file(path):
             )
         return Image.fromarray(rgb)
     elif PIL_AVAILABLE:
-        return Image.open(path).copy()
+        from PIL import ImageOps
+        img = Image.open(path).copy()
+        return ImageOps.exif_transpose(img)
     else:
         raise RuntimeError("No image loading backend available.")
 
@@ -300,8 +302,10 @@ def _load_nef_thumbnail(path, max_size):
         try:
             thumb = raw.extract_thumb()
             if thumb.format == rawpy.ThumbFormat.JPEG:
+                from PIL import ImageOps
                 img = Image.open(io.BytesIO(thumb.data))
                 img.load()
+                img = ImageOps.exif_transpose(img)
             elif thumb.format == rawpy.ThumbFormat.BITMAP:
                 img = Image.fromarray(thumb.data)
             else:
