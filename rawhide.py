@@ -14,12 +14,14 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Gio
 
+RAWPY_IMPORT_ERROR = None
 try:
     import rawpy
     RAWPY_AVAILABLE = True
-except ImportError:
+except Exception as _e:
     RAWPY_AVAILABLE = False
-    print("Warning: rawpy not available. NEF support disabled.")
+    RAWPY_IMPORT_ERROR = str(_e)
+    print(f"Warning: rawpy not available — {_e}")
 
 try:
     from PIL import Image
@@ -30,9 +32,8 @@ except ImportError:
     print("Warning: Pillow/numpy not available.")
 
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
-if RAWPY_AVAILABLE:
-    SUPPORTED_EXTENSIONS.update({".nef", ".nrw", ".raw"})
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".nef", ".nrw", ".raw"}
+RAW_EXTENSIONS = {".nef", ".nrw", ".raw"}
 
 APP_NAME = "Rawhide"
 APP_VERSION = "1.0.0"
@@ -59,7 +60,9 @@ def pil_image_to_pixbuf(pil_img):
 def load_image_file(path):
     """Load any supported image file, return PIL Image."""
     ext = os.path.splitext(path)[1].lower()
-    if ext in {".nef", ".nrw", ".raw"} and RAWPY_AVAILABLE:
+    if ext in RAW_EXTENSIONS and not RAWPY_AVAILABLE:
+        raise RuntimeError(f"rawpy is required to open RAW files but is not available: {RAWPY_IMPORT_ERROR}")
+    if ext in RAW_EXTENSIONS:
         with rawpy.imread(path) as raw:
             rgb = raw.postprocess(
                 use_camera_wb=True,
@@ -142,7 +145,7 @@ class ThumbnailLoader:
                 path = self._queue.pop(0)
             try:
                 ext = os.path.splitext(path)[1].lower()
-                if ext in {".nef", ".nrw", ".raw"} and RAWPY_AVAILABLE:
+                if ext in RAW_EXTENSIONS and RAWPY_AVAILABLE:
                     img = _load_nef_thumbnail(path, self.THUMB_SIZE)
                 else:
                     img = load_image_file(path)
@@ -402,7 +405,16 @@ class ImageViewer(Gtk.ApplicationWindow):
         path = os.path.abspath(path)
         ext = os.path.splitext(path)[1].lower()
         if ext not in SUPPORTED_EXTENSIONS:
-            self._show_error(f"Unsupported file type: {ext}")
+            self._show_error(f"Unsupported file type: {ext}\n\nSupported formats: NEF, NRW, JPG, PNG")
+            return
+        if ext in RAW_EXTENSIONS and not RAWPY_AVAILABLE:
+            msg = (
+                "rawpy is required to open NEF/RAW files but could not be loaded.\n\n"
+                f"Error: {RAWPY_IMPORT_ERROR}\n\n"
+                "Re-run the installer to repair the Python environment:\n"
+                "  sudo ./install.sh"
+            )
+            self._show_error(msg)
             return
 
         folder = os.path.dirname(path)
