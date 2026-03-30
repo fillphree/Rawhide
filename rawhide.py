@@ -679,8 +679,8 @@ class ImageViewer(Gtk.ApplicationWindow):
             child = next_child
 
         try:
-            entries = sorted(os.scandir(dir_path), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except PermissionError:
+            entries = sorted(os.scandir(dir_path), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+        except OSError:
             return
 
         for entry in entries:
