@@ -396,7 +396,16 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         self._thumb_loader = ThumbnailLoader(self._on_thumb_ready)
         self._thumb_path_to_row = {}
-        self._fs_loaded_dirs = set()   # dirs whose children have been populated
+        self._fs_loaded_dirs = set()
+
+        # Edit state — changes are cached here until "Save As"
+        self._edit_brightness = 0    # -100 … +100
+        self._crop_rect = None        # (x1, y1, x2, y2) in original image coords
+        self._crop_mode = False
+        self._crop_drag = None        # active drag descriptor
+        self._display_pixbuf = None   # currently rendered pixbuf
+        self._img_draw_x = 0          # image origin inside DrawingArea
+        self._img_draw_y = 0
 
         self._build_ui()
         self._connect_signals()
@@ -518,24 +527,21 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._scroll = Gtk.ScrolledWindow()
         self._scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
-        self._event_box = Gtk.EventBox()
-        self._event_box.add_events(
+        # DrawingArea renders both the image and the crop overlay in one pass
+        self._draw_area = Gtk.DrawingArea()
+        self._draw_area.add_events(
             Gdk.EventMask.SCROLL_MASK
             | Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
             | Gdk.EventMask.POINTER_MOTION_MASK
             | Gdk.EventMask.SMOOTH_SCROLL_MASK
         )
-        self._event_box.connect("scroll-event", self._on_scroll)
-        self._event_box.connect("button-press-event", self._on_button_press)
-        self._event_box.connect("button-release-event", self._on_button_release)
-        self._event_box.connect("motion-notify-event", self._on_motion)
-
-        self._image_widget = Gtk.Image()
-        self._image_widget.set_halign(Gtk.Align.CENTER)
-        self._image_widget.set_valign(Gtk.Align.CENTER)
-        self._event_box.add(self._image_widget)
-        self._scroll.add(self._event_box)
+        self._draw_area.connect("draw", self._on_draw)
+        self._draw_area.connect("scroll-event", self._on_scroll)
+        self._draw_area.connect("button-press-event", self._on_button_press)
+        self._draw_area.connect("button-release-event", self._on_button_release)
+        self._draw_area.connect("motion-notify-event", self._on_motion)
+        self._scroll.add(self._draw_area)
 
         self._statusbar = Gtk.Label(label="Open an image to get started  (Ctrl+O)")
         self._statusbar.set_halign(Gtk.Align.START)
@@ -557,6 +563,44 @@ class ImageViewer(Gtk.ApplicationWindow):
         overlay.add_overlay(spinner_box)
 
         image_box.pack_start(overlay, True, True, 0)
+        image_box.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ── Edit toolbar ─────────────────────────────────────────────
+        edit_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        edit_bar.set_margin_start(6)
+        edit_bar.set_margin_end(6)
+        edit_bar.set_margin_top(3)
+        edit_bar.set_margin_bottom(3)
+
+        self._btn_crop = Gtk.ToggleButton(label="✂  Crop")
+        self._btn_crop.set_tooltip_text("Toggle crop tool (C)")
+        self._btn_crop.connect("toggled", self._on_crop_toggled)
+        edit_bar.pack_start(self._btn_crop, False, False, 0)
+
+        btn_reset = Gtk.Button(label="↺  Reset")
+        btn_reset.set_tooltip_text("Reset all edits")
+        btn_reset.connect("clicked", lambda *_: self._reset_edits())
+        edit_bar.pack_start(btn_reset, False, False, 0)
+
+        edit_bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        edit_bar.pack_start(Gtk.Label(label="☀  Brightness:"), False, False, 0)
+        self._brightness_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, -100, 100, 1)
+        self._brightness_scale.set_value(0)
+        self._brightness_scale.set_draw_value(True)
+        self._brightness_scale.set_size_request(180, -1)
+        self._brightness_scale.connect("value-changed", self._on_brightness_changed)
+        edit_bar.pack_start(self._brightness_scale, False, False, 0)
+
+        edit_bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        btn_save_as = Gtk.Button(label="💾  Save As…")
+        btn_save_as.set_tooltip_text("Save edited image to a new file (Ctrl+Shift+S)")
+        btn_save_as.connect("clicked", lambda *_: self._on_save_as())
+        edit_bar.pack_end(btn_save_as, False, False, 0)
+
+        image_box.pack_start(edit_bar, False, False, 0)
         image_box.pack_start(Gtk.Separator(), False, False, 0)
         image_box.pack_start(self._statusbar, False, False, 0)
 
@@ -637,7 +681,8 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._spinner_box.hide()
 
     def _show_placeholder(self):
-        self._image_widget.set_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.DIALOG)
+        self._display_pixbuf = None
+        self._draw_area.queue_draw()
 
     # ------------------------------------------------------------------
     # Filesystem tree
@@ -925,6 +970,11 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._current_pil = img
         self._zoom = 1.0
         self._fit_mode = True
+        # Reset edits for the new image
+        self._edit_brightness = 0
+        self._brightness_scale.set_value(0)
+        self._crop_rect = None
+        self._crop_drag = None
         self._display_image()
         self._update_title()
         self._update_status()
@@ -960,16 +1010,14 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._render_at_zoom(self._zoom)
 
     def _render_at_zoom(self, scale):
-        img = self._current_pil
+        img = self._get_brightness_image()  # apply brightness, not crop (crop is drawn as overlay)
         w = max(1, int(img.width * scale))
         h = max(1, int(img.height * scale))
-        if scale < 1.0:
-            resample = Image.LANCZOS
-        else:
-            resample = Image.NEAREST
+        resample = Image.LANCZOS if scale < 1.0 else Image.NEAREST
         resized = img.resize((w, h), resample)
-        pixbuf = pil_image_to_pixbuf(resized)
-        self._image_widget.set_from_pixbuf(pixbuf)
+        self._display_pixbuf = pil_image_to_pixbuf(resized)
+        self._draw_area.set_size_request(w, h)
+        self._draw_area.queue_draw()
 
     def _adjust_zoom(self, factor):
         self._fit_mode = False
@@ -1031,24 +1079,33 @@ class ImageViewer(Gtk.ApplicationWindow):
 
     def _on_button_press(self, widget, event):
         if event.button == 1:
-            self._drag_start = (event.x_root, event.y_root)
-            hadj = self._scroll.get_hadjustment()
-            vadj = self._scroll.get_vadjustment()
-            self._scroll_origin = (hadj.get_value(), vadj.get_value())
-            widget.get_window().set_cursor(
-                Gdk.Cursor.new_from_name(widget.get_display(), "grabbing")
-            )
+            if self._crop_mode and self._display_pixbuf:
+                self._crop_press(event.x, event.y)
+            else:
+                self._drag_start = (event.x_root, event.y_root)
+                hadj = self._scroll.get_hadjustment()
+                vadj = self._scroll.get_vadjustment()
+                self._scroll_origin = (hadj.get_value(), vadj.get_value())
+                widget.get_window().set_cursor(
+                    Gdk.Cursor.new_from_name(widget.get_display(), "grabbing")
+                )
         return False
 
     def _on_button_release(self, widget, event):
         if event.button == 1:
-            self._drag_start = None
-            self._scroll_origin = None
-            widget.get_window().set_cursor(None)
+            if self._crop_mode:
+                self._crop_drag = None
+                self._draw_area.queue_draw()
+            else:
+                self._drag_start = None
+                self._scroll_origin = None
+                widget.get_window().set_cursor(None)
         return False
 
     def _on_motion(self, widget, event):
-        if self._drag_start and self._scroll_origin:
+        if self._crop_mode and self._crop_drag:
+            self._crop_move(event.x, event.y)
+        elif self._drag_start and self._scroll_origin:
             dx = self._drag_start[0] - event.x_root
             dy = self._drag_start[1] - event.y_root
             hadj = self._scroll.get_hadjustment()
@@ -1085,6 +1142,10 @@ class ImageViewer(Gtk.ApplicationWindow):
             self._toggle_fullscreen()
         elif key == Gdk.KEY_e or key == Gdk.KEY_E:
             self._btn_exif.set_active(not self._btn_exif.get_active())
+        elif key == Gdk.KEY_c or key == Gdk.KEY_C:
+            self._btn_crop.set_active(not self._btn_crop.get_active())
+        elif ctrl and (event.state & Gdk.ModifierType.SHIFT_MASK) and key == Gdk.KEY_S:
+            self._on_save_as()
         elif key == Gdk.KEY_q and ctrl:
             self.get_application().quit()
         return False
@@ -1100,6 +1161,336 @@ class ImageViewer(Gtk.ApplicationWindow):
         else:
             self.fullscreen()
             self._fullscreen = True
+
+    # ------------------------------------------------------------------
+    # Image rendering (DrawingArea)
+    # ------------------------------------------------------------------
+
+    def _on_draw(self, da, cr):
+        from gi.repository import Gdk as _Gdk
+        alloc = da.get_allocation()
+        dw, dh = alloc.width, alloc.height
+
+        cr.set_source_rgb(0.15, 0.15, 0.15)
+        cr.paint()
+
+        if self._display_pixbuf is None:
+            # Placeholder icon
+            cr.set_source_rgb(0.4, 0.4, 0.4)
+            cr.set_font_size(14)
+            msg = "Open an image to get started  (Ctrl+O)"
+            ext = cr.text_extents(msg)
+            cr.move_to((dw - ext.width) / 2, dh / 2)
+            cr.show_text(msg)
+            return
+
+        pw = self._display_pixbuf.get_width()
+        ph = self._display_pixbuf.get_height()
+        self._img_draw_x = max(0, (dw - pw) // 2)
+        self._img_draw_y = max(0, (dh - ph) // 2)
+
+        _Gdk.cairo_set_source_pixbuf(cr, self._display_pixbuf,
+                                     self._img_draw_x, self._img_draw_y)
+        cr.paint()
+
+        if self._crop_mode:
+            self._draw_crop_overlay(cr, pw, ph)
+
+    # ------------------------------------------------------------------
+    # Non-destructive editing
+    # ------------------------------------------------------------------
+
+    def _get_brightness_image(self):
+        """Return _current_pil with brightness applied (no crop)."""
+        img = self._current_pil
+        if img is None:
+            return None
+        if self._edit_brightness != 0:
+            from PIL import ImageEnhance
+            factor = max(0.0, 1.0 + self._edit_brightness / 100.0)
+            img = ImageEnhance.Brightness(img).enhance(factor)
+        return img
+
+    def _get_edited_image(self):
+        """Return the fully edited image (brightness + crop) for Save As."""
+        img = self._get_brightness_image()
+        if img is None:
+            return None
+        if self._crop_rect:
+            x1, y1, x2, y2 = self._crop_rect
+            left   = max(0, int(round(min(x1, x2))))
+            top    = max(0, int(round(min(y1, y2))))
+            right  = min(img.width,  int(round(max(x1, x2))))
+            bottom = min(img.height, int(round(max(y1, y2))))
+            if right > left and bottom > top:
+                img = img.crop((left, top, right, bottom))
+        return img
+
+    def _on_brightness_changed(self, scale):
+        self._edit_brightness = int(scale.get_value())
+        if self._current_pil:
+            self._display_image()
+
+    def _reset_edits(self):
+        self._edit_brightness = 0
+        self._brightness_scale.set_value(0)
+        self._crop_rect = None
+        self._crop_drag = None
+        self._btn_crop.set_active(False)
+        if self._current_pil:
+            self._display_image()
+
+    # ------------------------------------------------------------------
+    # Crop tool
+    # ------------------------------------------------------------------
+
+    # Handle layout (index → which coords it controls):
+    #   0(TL) 1(TC) 2(TR)
+    #   3(ML)       4(MR)
+    #   5(BL) 6(BC) 7(BR)
+    _HANDLE_AXES = [
+        ('x1', 'y1'), (None, 'y1'), ('x2', 'y1'),
+        ('x1',  None),              ('x2',  None),
+        ('x1', 'y2'), (None, 'y2'), ('x2', 'y2'),
+    ]
+    _HANDLE_CURSORS = [
+        "nw-resize", "n-resize", "ne-resize",
+        "w-resize",              "e-resize",
+        "sw-resize", "s-resize", "se-resize",
+    ]
+
+    def _on_crop_toggled(self, btn):
+        self._crop_mode = btn.get_active()
+        if not self._crop_mode:
+            self._crop_drag = None
+        if self._display_pixbuf:
+            self._draw_area.queue_draw()
+
+    def _img_to_screen(self, ix, iy):
+        return (self._img_draw_x + ix * self._zoom,
+                self._img_draw_y + iy * self._zoom)
+
+    def _screen_to_img(self, sx, sy):
+        return ((sx - self._img_draw_x) / self._zoom,
+                (sy - self._img_draw_y) / self._zoom)
+
+    def _get_handles_screen(self):
+        """Return list of 8 (sx, sy) handle positions in screen coords."""
+        if not self._crop_rect:
+            return []
+        x1, y1, x2, y2 = self._crop_rect
+        lx, rx = sorted([x1, x2])
+        ty, by = sorted([y1, y2])
+        cx, cy = (lx + rx) / 2, (ty + by) / 2
+        pts = [(lx, ty), (cx, ty), (rx, ty),
+               (lx, cy),           (rx, cy),
+               (lx, by), (cx, by), (rx, by)]
+        return [self._img_to_screen(ix, iy) for ix, iy in pts]
+
+    def _handle_at(self, sx, sy, radius=8):
+        for i, (hx, hy) in enumerate(self._get_handles_screen()):
+            if abs(sx - hx) <= radius and abs(sy - hy) <= radius:
+                return i
+        return None
+
+    def _inside_crop(self, sx, sy):
+        if not self._crop_rect:
+            return False
+        x1, y1, x2, y2 = self._crop_rect
+        lx, rx = sorted([x1 * self._zoom + self._img_draw_x,
+                          x2 * self._zoom + self._img_draw_x])
+        ty, by = sorted([y1 * self._zoom + self._img_draw_y,
+                          y2 * self._zoom + self._img_draw_y])
+        return lx <= sx <= rx and ty <= sy <= by
+
+    def _crop_press(self, sx, sy):
+        ix, iy = self._screen_to_img(sx, sy)
+        h = self._handle_at(sx, sy)
+        if h is not None:
+            self._crop_drag = {
+                'type': 'handle', 'idx': h,
+                'orig': self._crop_rect,
+                'start_ix': ix, 'start_iy': iy,
+            }
+        elif self._inside_crop(sx, sy):
+            x1, y1, x2, y2 = self._crop_rect
+            self._crop_drag = {
+                'type': 'move',
+                'orig': self._crop_rect,
+                'start_ix': ix, 'start_iy': iy,
+            }
+        else:
+            # Start a new selection
+            self._crop_drag = {
+                'type': 'new',
+                'start_ix': ix, 'start_iy': iy,
+            }
+            self._crop_rect = (ix, iy, ix, iy)
+        self._draw_area.queue_draw()
+
+    def _crop_move(self, sx, sy):
+        if not self._crop_drag:
+            return
+        ix, iy = self._screen_to_img(sx, sy)
+        iw = self._current_pil.width
+        ih = self._current_pil.height
+        d = self._crop_drag
+
+        if d['type'] == 'new':
+            self._crop_rect = (d['start_ix'], d['start_iy'], ix, iy)
+
+        elif d['type'] == 'handle':
+            ox1, oy1, ox2, oy2 = d['orig']
+            dx = ix - d['start_ix']
+            dy = iy - d['start_iy']
+            x_axis, y_axis = self._HANDLE_AXES[d['idx']]
+            nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
+            if x_axis == 'x1':
+                nx1 = max(0, min(ox1 + dx, iw))
+            elif x_axis == 'x2':
+                nx2 = max(0, min(ox2 + dx, iw))
+            if y_axis == 'y1':
+                ny1 = max(0, min(oy1 + dy, ih))
+            elif y_axis == 'y2':
+                ny2 = max(0, min(oy2 + dy, ih))
+            self._crop_rect = (nx1, ny1, nx2, ny2)
+
+        elif d['type'] == 'move':
+            ox1, oy1, ox2, oy2 = d['orig']
+            dx = ix - d['start_ix']
+            dy = iy - d['start_iy']
+            w = ox2 - ox1
+            h = oy2 - oy1
+            nx1 = max(0, min(ox1 + dx, iw - w))
+            ny1 = max(0, min(oy1 + dy, ih - h))
+            self._crop_rect = (nx1, ny1, nx1 + w, ny1 + h)
+
+        self._draw_area.queue_draw()
+
+    def _draw_crop_overlay(self, cr, img_screen_w, img_screen_h):
+        ix = self._img_draw_x
+        iy = self._img_draw_y
+
+        if self._crop_rect:
+            x1, y1, x2, y2 = self._crop_rect
+            lx, rx = sorted([x1, x2])
+            ty, by = sorted([y1, y2])
+            sx1 = ix + lx * self._zoom
+            sy1 = iy + ty * self._zoom
+            sx2 = ix + rx * self._zoom
+            sy2 = iy + by * self._zoom
+
+            # Darken outside crop
+            cr.set_source_rgba(0, 0, 0, 0.55)
+            cr.rectangle(ix, iy, img_screen_w, sy1 - iy)
+            cr.fill()
+            cr.rectangle(ix, sy2, img_screen_w, iy + img_screen_h - sy2)
+            cr.fill()
+            cr.rectangle(ix, sy1, sx1 - ix, sy2 - sy1)
+            cr.fill()
+            cr.rectangle(sx2, sy1, ix + img_screen_w - sx2, sy2 - sy1)
+            cr.fill()
+
+            # Crop border
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(1.5)
+            cr.rectangle(sx1, sy1, sx2 - sx1, sy2 - sy1)
+            cr.stroke()
+
+            # Rule-of-thirds grid
+            cr.set_source_rgba(1, 1, 1, 0.35)
+            cr.set_line_width(0.7)
+            cw, ch = sx2 - sx1, sy2 - sy1
+            for t in (1/3, 2/3):
+                cr.move_to(sx1 + cw * t, sy1); cr.line_to(sx1 + cw * t, sy2); cr.stroke()
+                cr.move_to(sx1, sy1 + ch * t); cr.line_to(sx2, sy1 + ch * t); cr.stroke()
+
+            # Handles
+            for hx, hy in self._get_handles_screen():
+                cr.set_source_rgb(1, 1, 1)
+                cr.rectangle(hx - 5, hy - 5, 10, 10)
+                cr.fill()
+                cr.set_source_rgb(0.25, 0.25, 0.25)
+                cr.set_line_width(1)
+                cr.rectangle(hx - 5, hy - 5, 10, 10)
+                cr.stroke()
+        else:
+            # No rect yet — show a faint "draw here" hint
+            cr.set_source_rgba(1, 1, 1, 0.25)
+            cr.set_line_width(1)
+            cr.set_dash([6, 4], 0)
+            cr.rectangle(ix + 2, iy + 2, img_screen_w - 4, img_screen_h - 4)
+            cr.stroke()
+            cr.set_dash([], 0)
+
+    # ------------------------------------------------------------------
+    # Save As
+    # ------------------------------------------------------------------
+
+    def _on_save_as(self):
+        if self._current_pil is None:
+            return
+        dialog = Gtk.FileChooserDialog(
+            title="Save Edited Image As",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE,   Gtk.ResponseType.OK,
+        )
+        dialog.set_do_overwrite_confirmation(True)
+
+        # Suggest a name derived from the original but different
+        orig_name = os.path.basename(self._current_path)
+        base, _ext = os.path.splitext(orig_name)
+        dialog.set_current_folder(os.path.dirname(self._current_path))
+        dialog.set_current_name(f"{base}_edited.jpg")
+
+        flt = Gtk.FileFilter()
+        flt.set_name("JPEG / PNG")
+        flt.add_pattern("*.jpg"); flt.add_pattern("*.jpeg"); flt.add_pattern("*.png")
+        dialog.add_filter(flt)
+
+        response = dialog.run()
+        save_path = dialog.get_filename() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+
+        if not save_path:
+            return
+
+        # Safety: refuse to overwrite the original file
+        if os.path.realpath(save_path) == os.path.realpath(self._current_path):
+            self._show_error("Cannot overwrite the original file.\nPlease choose a different filename.")
+            return
+
+        ext = os.path.splitext(save_path)[1].lower()
+        if ext not in (".jpg", ".jpeg", ".png"):
+            save_path += ".jpg"
+            ext = ".jpg"
+
+        try:
+            edited = self._get_edited_image()
+            if ext in (".jpg", ".jpeg"):
+                if edited.mode in ("RGBA", "P"):
+                    edited = edited.convert("RGB")
+                edited.save(save_path, "JPEG", quality=95)
+            else:
+                edited.save(save_path, "PNG")
+        except Exception as e:
+            self._show_error(f"Failed to save:\n{e}")
+            return
+
+        # Confirm to user
+        dialog2 = Gtk.MessageDialog(
+            transient_for=self, flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text="Image saved",
+        )
+        dialog2.format_secondary_text(save_path)
+        dialog2.run()
+        dialog2.destroy()
 
     # ------------------------------------------------------------------
     # EXIF panel
