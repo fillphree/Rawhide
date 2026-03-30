@@ -31,7 +31,7 @@ info "Installing Rawhide Image Viewer..."
 # ---------------------------------------------------------------
 info "Checking system packages..."
 PKGS=()
-for pkg in python3 python3-gi python3-pip gir1.2-gtk-3.0 libgtk-3-0; do
+for pkg in python3 python3-gi python3-gi-cairo python3-pip gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0 libgtk-3-0; do
     dpkg -s "$pkg" &>/dev/null || PKGS+=("$pkg")
 done
 

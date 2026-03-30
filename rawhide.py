@@ -74,6 +74,28 @@ def load_image_file(path):
         raise RuntimeError("No image loading backend available.")
 
 
+def _load_nef_thumbnail(path, max_size):
+    """Fast NEF thumbnail using the camera-embedded JPEG (milliseconds vs. seconds).
+    Falls back to half-size postprocess if no embedded thumb is available."""
+    import io
+    with rawpy.imread(path) as raw:
+        try:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+                img.load()
+            elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                img = Image.fromarray(thumb.data)
+            else:
+                raise ValueError("Unknown thumb format")
+        except rawpy.LibRawNoThumbnailError:
+            # No embedded thumbnail — half-size decode as fallback
+            rgb = raw.postprocess(use_camera_wb=True, half_size=True, output_bps=8)
+            img = Image.fromarray(rgb)
+    img.thumbnail((max_size, max_size), Image.LANCZOS)
+    return img
+
+
 def get_folder_images(folder):
     """Return sorted list of supported image paths in a folder."""
     try:
@@ -119,8 +141,12 @@ class ThumbnailLoader:
                     return
                 path = self._queue.pop(0)
             try:
-                img = load_image_file(path)
-                img.thumbnail((self.THUMB_SIZE, self.THUMB_SIZE), Image.LANCZOS)
+                ext = os.path.splitext(path)[1].lower()
+                if ext in {".nef", ".nrw", ".raw"} and RAWPY_AVAILABLE:
+                    img = _load_nef_thumbnail(path, self.THUMB_SIZE)
+                else:
+                    img = load_image_file(path)
+                    img.thumbnail((self.THUMB_SIZE, self.THUMB_SIZE), Image.LANCZOS)
                 pixbuf = pil_image_to_pixbuf(img)
                 GLib.idle_add(self._on_ready, path, pixbuf)
             except Exception:
