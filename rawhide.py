@@ -87,6 +87,211 @@ def load_image_file(path):
         raise RuntimeError("No image loading backend available.")
 
 
+def load_exif_data(path):
+    """Return EXIF data as an ordered list of (field, value, is_header) tuples.
+    Works for JPG, PNG, and NEF (PIL reads TIFF-based metadata from NEF
+    without needing to fully decode the RAW image)."""
+    from PIL import ExifTags
+
+    # Friendly names for the tags we care about, in display order
+    WANTED = {
+        # Camera
+        "Make":              "Make",
+        "Model":             "Model",
+        "LensModel":         "Lens",
+        "Software":          "Software",
+        # Capture settings
+        "DateTime":          "Date / Time",
+        "ExposureTime":      "Exposure",
+        "FNumber":           "Aperture",
+        "ISOSpeedRatings":   "ISO",
+        "FocalLength":       "Focal Length",
+        "FocalLengthIn35mmFilm": "Focal (35 mm equiv)",
+        "ExposureBiasValue": "Exp. Bias",
+        "ExposureMode":      "Exp. Mode",
+        "ExposureProgram":   "Exp. Program",
+        "MeteringMode":      "Metering",
+        "WhiteBalance":      "White Balance",
+        "Flash":             "Flash",
+        "SceneCaptureType":  "Scene Type",
+        # Image
+        "ImageWidth":        "Width",
+        "ImageLength":       "Height",
+        "Orientation":       "Orientation",
+        "ColorSpace":        "Color Space",
+        "BitsPerSample":     "Bit Depth",
+        # GPS
+        "GPSInfo":           "GPS",
+    }
+
+    # Human-readable value maps for integer-coded fields
+    EXPOSURE_PROGRAMS = {0:"Not defined",1:"Manual",2:"Auto",3:"Aperture priority",
+                         4:"Shutter priority",5:"Creative",6:"Action",7:"Portrait",8:"Landscape"}
+    METERING_MODES    = {0:"Unknown",1:"Average",2:"Center-weighted",3:"Spot",
+                         4:"Multi-spot",5:"Multi-segment",6:"Partial"}
+    WHITE_BALANCE     = {0:"Auto",1:"Manual"}
+    EXPOSURE_MODES    = {0:"Auto",1:"Manual",2:"Auto bracket"}
+    ORIENTATIONS      = {1:"Normal",2:"Flipped H",3:"Rotated 180°",4:"Flipped V",
+                         5:"Transposed",6:"Rotated 90° CW",7:"Transverse",8:"Rotated 90° CCW"}
+    COLOR_SPACES      = {1:"sRGB",65535:"Uncalibrated"}
+    SCENE_TYPES       = {0:"Standard",1:"Landscape",2:"Portrait",3:"Night scene"}
+
+    rows = []  # (field, value, is_header)
+
+    def section(title):
+        rows.append((title, "", True))
+
+    def row(label, val):
+        rows.append((label, str(val), False))
+
+    # ---- File info (always available) ----
+    section("File")
+    row("Name", os.path.basename(path))
+    try:
+        size = os.path.getsize(path)
+        row("File Size", f"{size / 1_048_576:.2f} MB" if size >= 1_048_576 else f"{size / 1024:.1f} KB")
+    except OSError:
+        pass
+
+    # ---- EXIF via PIL ----
+    try:
+        # PIL can open NEF just for metadata (TIFF-based), even without rawpy
+        img = Image.open(path)
+        w, h = img.size
+        row("Dimensions", f"{w} × {h} px")
+
+        exif = img.getexif()
+        if not exif:
+            return rows
+
+        # Build a name→value dict for wanted tags
+        tag_name_map = {v: k for k, v in ExifTags.TAGS.items()}  # name → id
+        found = {}
+        for tag_id, value in exif.items():
+            tag_name = ExifTags.TAGS.get(tag_id)
+            if tag_name and tag_name in WANTED:
+                found[tag_name] = value
+
+        # Also check IFD sub-tables (e.g. Exif IFD, GPS IFD)
+        try:
+            ifd = exif.get_ifd(0x8769)  # ExifIFD
+            for tag_id, value in ifd.items():
+                tag_name = ExifTags.TAGS.get(tag_id)
+                if tag_name and tag_name in WANTED:
+                    found[tag_name] = value
+        except Exception:
+            pass
+        try:
+            gps_ifd = exif.get_ifd(0x8825)  # GPS IFD
+            if gps_ifd:
+                found["GPSInfo"] = gps_ifd
+        except Exception:
+            pass
+
+        if not found:
+            return rows
+
+        # ---- Camera section ----
+        cam_keys = ["Make", "Model", "LensModel", "Software"]
+        if any(k in found for k in cam_keys):
+            section("Camera")
+            for k in cam_keys:
+                if k in found:
+                    row(WANTED[k], str(found[k]).strip())
+
+        # ---- Capture section ----
+        capture_keys = ["DateTime","ExposureTime","FNumber","ISOSpeedRatings",
+                        "FocalLength","FocalLengthIn35mmFilm","ExposureBiasValue",
+                        "ExposureMode","ExposureProgram","MeteringMode",
+                        "WhiteBalance","Flash","SceneCaptureType"]
+        if any(k in found for k in capture_keys):
+            section("Capture")
+            for k in capture_keys:
+                if k not in found:
+                    continue
+                v = found[k]
+                label = WANTED[k]
+                if k == "ExposureTime":
+                    try:
+                        f = float(v)
+                        row(label, f"1/{int(1/f)}s" if f < 1 else f"{f}s")
+                    except Exception:
+                        row(label, str(v))
+                elif k == "FNumber":
+                    try:
+                        row(label, f"f/{float(v):.1f}")
+                    except Exception:
+                        row(label, str(v))
+                elif k in ("FocalLength", "FocalLengthIn35mmFilm"):
+                    try:
+                        row(label, f"{float(v):.0f} mm")
+                    except Exception:
+                        row(label, str(v))
+                elif k == "ExposureBiasValue":
+                    try:
+                        row(label, f"{float(v):+.1f} EV")
+                    except Exception:
+                        row(label, str(v))
+                elif k == "ExposureProgram":
+                    row(label, EXPOSURE_PROGRAMS.get(int(v), str(v)))
+                elif k == "MeteringMode":
+                    row(label, METERING_MODES.get(int(v), str(v)))
+                elif k == "WhiteBalance":
+                    row(label, WHITE_BALANCE.get(int(v), str(v)))
+                elif k == "ExposureMode":
+                    row(label, EXPOSURE_MODES.get(int(v), str(v)))
+                elif k == "Flash":
+                    row(label, "On" if int(v) & 0x1 else "Off")
+                elif k == "SceneCaptureType":
+                    row(label, SCENE_TYPES.get(int(v), str(v)))
+                else:
+                    row(label, str(v))
+
+        # ---- Image section ----
+        img_keys = ["Orientation","ColorSpace","BitsPerSample"]
+        if any(k in found for k in img_keys):
+            section("Image")
+            for k in img_keys:
+                if k not in found:
+                    continue
+                v = found[k]
+                label = WANTED[k]
+                if k == "Orientation":
+                    row(label, ORIENTATIONS.get(int(v), str(v)))
+                elif k == "ColorSpace":
+                    row(label, COLOR_SPACES.get(int(v), str(v)))
+                else:
+                    row(label, str(v))
+
+        # ---- GPS section ----
+        if "GPSInfo" in found:
+            gps = found["GPSInfo"]
+            if isinstance(gps, dict) and gps:
+                section("GPS")
+                try:
+                    gps_tags = ExifTags.GPSTAGS
+                    lat_ref = gps.get(1, "")
+                    lat     = gps.get(2)
+                    lon_ref = gps.get(3, "")
+                    lon     = gps.get(4)
+                    if lat and lon:
+                        def dms(t):
+                            return float(t[0]) + float(t[1])/60 + float(t[2])/3600
+                        la = dms(lat) * (-1 if lat_ref == "S" else 1)
+                        lo = dms(lon) * (-1 if lon_ref == "W" else 1)
+                        row("Latitude",  f"{la:.6f}°")
+                        row("Longitude", f"{lo:.6f}°")
+                    alt = gps.get(6)
+                    if alt is not None:
+                        row("Altitude", f"{float(alt):.1f} m")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return rows
+
+
 def _load_nef_thumbnail(path, max_size):
     """Fast NEF thumbnail using the camera-embedded JPEG (milliseconds vs. seconds).
     Falls back to half-size postprocess if no embedded thumb is available."""
@@ -244,6 +449,14 @@ class ImageViewer(Gtk.ApplicationWindow):
         btn_fs.connect("clicked", lambda *_: self._toggle_fullscreen())
         header.pack_end(btn_fs)
 
+        btn_exif = Gtk.ToggleButton()
+        btn_exif.set_image(Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.BUTTON))
+        btn_exif.set_tooltip_text("Toggle EXIF panel (E)")
+        btn_exif.set_active(True)
+        btn_exif.connect("toggled", self._on_exif_toggle)
+        self._btn_exif = btn_exif
+        header.pack_end(btn_exif)
+
         # Main horizontal pane: sidebar | image area
         self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.add(self._paned)
@@ -340,7 +553,55 @@ class ImageViewer(Gtk.ApplicationWindow):
         image_box.pack_start(Gtk.Separator(), False, False, 0)
         image_box.pack_start(self._statusbar, False, False, 0)
 
-        self._paned.pack2(image_box, True, True)
+        # --- EXIF panel (right side) ---
+        exif_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        exif_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        exif_title = Gtk.Label(label="EXIF")
+        exif_title.set_halign(Gtk.Align.START)
+        exif_title.set_margin_start(6)
+        exif_title.set_margin_top(4)
+        exif_title.set_margin_bottom(4)
+        exif_header.pack_start(exif_title, True, True, 0)
+        exif_outer.pack_start(exif_header, False, False, 0)
+        exif_outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        scroll_exif = Gtk.ScrolledWindow()
+        scroll_exif.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll_exif.set_min_content_width(200)
+
+        # Store: field (str), value (str), is_header (bool for bold)
+        self._exif_store = Gtk.ListStore(str, str, bool)
+        self._exif_view = Gtk.TreeView(model=self._exif_store)
+        self._exif_view.set_headers_visible(False)
+        self._exif_view.set_can_focus(False)
+
+        # Field column
+        field_cell = Gtk.CellRendererText()
+        field_cell.set_property("xpad", 6)
+        field_cell.set_property("ypad", 2)
+        field_col = Gtk.TreeViewColumn("Field", field_cell, text=0, weight_set=2)
+        field_col.add_attribute(field_cell, "weight", 2)
+        self._exif_view.append_column(field_col)
+
+        # Value column
+        val_cell = Gtk.CellRendererText()
+        val_cell.set_property("xpad", 6)
+        val_cell.set_property("ypad", 2)
+        val_cell.set_property("ellipsize", 3)  # PANGO_ELLIPSIZE_END
+        val_col = Gtk.TreeViewColumn("Value", val_cell, text=1)
+        val_col.set_expand(True)
+        self._exif_view.append_column(val_col)
+
+        scroll_exif.add(self._exif_view)
+        exif_outer.pack_start(scroll_exif, True, True, 0)
+
+        # Right pane splits image | EXIF
+        self._right_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self._right_paned.pack1(image_box, True, True)
+        self._right_paned.pack2(exif_outer, False, False)
+
+        self._paned.pack2(self._right_paned, True, True)
 
         # Welcome screen placeholder
         self._show_placeholder()
@@ -513,11 +774,12 @@ class ImageViewer(Gtk.ApplicationWindow):
     def _load_worker(self, path):
         try:
             img = load_image_file(path)
-            GLib.idle_add(self._on_image_loaded, path, img, None)
+            exif = load_exif_data(path)
+            GLib.idle_add(self._on_image_loaded, path, img, exif, None)
         except Exception as e:
-            GLib.idle_add(self._on_image_loaded, path, None, str(e))
+            GLib.idle_add(self._on_image_loaded, path, None, [], str(e))
 
-    def _on_image_loaded(self, path, img, error):
+    def _on_image_loaded(self, path, img, exif, error):
         self._loading = False
         self._spinner.stop()
         self._spinner_box.hide()
@@ -535,6 +797,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._update_status()
         self._update_nav_buttons()
         self._sidebar_select(path)
+        self._populate_exif(exif)
         gc.collect()
         return False
 
@@ -686,6 +949,8 @@ class ImageViewer(Gtk.ApplicationWindow):
             self._toggle_fullscreen()
         elif key == Gdk.KEY_Escape and self._fullscreen:
             self._toggle_fullscreen()
+        elif key == Gdk.KEY_e or key == Gdk.KEY_E:
+            self._btn_exif.set_active(not self._btn_exif.get_active())
         elif key == Gdk.KEY_q and ctrl:
             self.get_application().quit()
         return False
@@ -701,6 +966,25 @@ class ImageViewer(Gtk.ApplicationWindow):
         else:
             self.fullscreen()
             self._fullscreen = True
+
+    # ------------------------------------------------------------------
+    # EXIF panel
+    # ------------------------------------------------------------------
+
+    def _populate_exif(self, rows):
+        """Fill the EXIF TreeView. rows = [(field, value, is_header), ...]"""
+        self._exif_store.clear()
+        BOLD   = 700  # Pango.Weight.BOLD
+        NORMAL = 400  # Pango.Weight.NORMAL
+        for field, value, is_header in rows:
+            self._exif_store.append([field, value, BOLD if is_header else NORMAL])
+
+    def _on_exif_toggle(self, btn):
+        _, exif_widget = self._right_paned.get_children()
+        if btn.get_active():
+            exif_widget.show()
+        else:
+            exif_widget.hide()
 
     # ------------------------------------------------------------------
     # UI helpers
