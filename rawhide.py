@@ -572,7 +572,7 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         scroll_exif = Gtk.ScrolledWindow()
         scroll_exif.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll_exif.set_min_content_width(210)
+        scroll_exif.set_min_content_width(420)
 
         self._exif_store = Gtk.ListStore(str, str, bool)
         self._exif_view = Gtk.TreeView(model=self._exif_store)
@@ -610,8 +610,6 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         scroll_thumb = Gtk.ScrolledWindow()
         scroll_thumb.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
-        scroll_thumb.set_min_content_height(ThumbnailLoader.THUMB_SIZE + 30)
-        scroll_thumb.set_max_content_height(ThumbnailLoader.THUMB_SIZE + 30)
 
         # ListStore: path (str), thumb (Pixbuf), name (str)
         self._store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str)
@@ -619,9 +617,12 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._thumb_view.set_pixbuf_column(1)
         self._thumb_view.set_text_column(2)
         self._thumb_view.set_item_width(ThumbnailLoader.THUMB_SIZE + 10)
-        self._thumb_view.set_row_spacing(0)
+        self._thumb_view.set_row_spacing(2)
         self._thumb_view.set_column_spacing(2)
+        self._thumb_view.set_columns(9999)   # force single row, scroll horizontally
         self._thumb_view.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        # Fix height to exactly one row so the strip never grows vertically
+        self._thumb_view.set_size_request(-1, ThumbnailLoader.THUMB_SIZE + 36)
         self._thumb_view.connect("item-activated", self._on_thumb_activated)
 
         scroll_thumb.add(self._thumb_view)
@@ -643,16 +644,14 @@ class ImageViewer(Gtk.ApplicationWindow):
     # ------------------------------------------------------------------
 
     def _fs_populate_roots(self):
-        """Seed the tree with Home and common mount roots."""
-        roots = []
+        """Seed the tree with the home directory, expanded one level."""
         home = os.path.expanduser("~")
-        roots.append((os.path.basename(home) or "Home", home))
-        for candidate in ("/media", "/mnt", "/run/media"):
-            if os.path.isdir(candidate):
-                roots.append((candidate, candidate))
-        for name, path in roots:
-            it = self._fs_store.append(None, [name, path, True])
-            self._fs_store.append(it, ["", "", False])   # dummy child
+        name = os.path.basename(home) or "Home"
+        it = self._fs_store.append(None, [name, home, True])
+        self._fs_store.append(it, ["", "", False])   # dummy child
+        # Pre-load and expand one level so the tree is useful immediately
+        self._fs_load_dir(it, home)
+        GLib.idle_add(self._fs_tree.expand_row, self._fs_store.get_path(it), False)
 
     def _fs_icon_func(self, col, cell, model, it, data):
         is_dir = model.get_value(it, 2)
@@ -709,6 +708,42 @@ class ImageViewer(Gtk.ApplicationWindow):
                 tree_view.expand_row(tree_path, False)
         else:
             self.open_file(path)
+
+    def _fs_reveal_path(self, file_path):
+        """Select and scroll to file_path in the filesystem tree.
+        Expands and lazy-loads ancestor directories as needed."""
+        folder = os.path.dirname(file_path)
+
+        def _walk(parent_iter):
+            child = self._fs_store.iter_children(parent_iter)
+            while child:
+                child_path  = self._fs_store.get_value(child, 1)
+                child_is_dir = self._fs_store.get_value(child, 2)
+                if child_path == file_path:
+                    tp = self._fs_store.get_path(child)
+                    self._fs_tree.get_selection().select_path(tp)
+                    self._fs_tree.scroll_to_cell(tp, None, True, 0.5, 0.0)
+                    return True
+                if child_is_dir and folder.startswith(child_path + os.sep):
+                    # This dir is an ancestor — expand and recurse
+                    self._fs_load_dir(child, child_path)
+                    tp = self._fs_store.get_path(child)
+                    self._fs_tree.expand_row(tp, False)
+                    return _walk(child)
+                child = self._fs_store.iter_next(child)
+            return False
+
+        # Try from each root; if the file is in a directory that wasn't
+        # loaded yet under an existing root, load and expand as we go.
+        root = self._fs_store.get_iter_first()
+        while root:
+            root_path = self._fs_store.get_value(root, 1)
+            if file_path.startswith(root_path + os.sep) or os.path.dirname(file_path) == root_path:
+                self._fs_load_dir(root, root_path)
+                self._fs_tree.expand_row(self._fs_store.get_path(root), False)
+                _walk(root)
+                break
+            root = self._fs_store.iter_next(root)
 
     # ------------------------------------------------------------------
     # Signal connections
@@ -896,6 +931,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._update_nav_buttons()
         self._sidebar_select(path)
         self._populate_exif(exif)
+        self._fs_reveal_path(path)
         gc.collect()
         return False
 
