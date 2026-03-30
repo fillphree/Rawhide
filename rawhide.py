@@ -396,6 +396,7 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         self._thumb_loader = ThumbnailLoader(self._on_thumb_ready)
         self._thumb_path_to_row = {}
+        self._fs_loaded_dirs = set()   # dirs whose children have been populated
 
         self._build_ui()
         self._connect_signals()
@@ -405,13 +406,12 @@ class ImageViewer(Gtk.ApplicationWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # Overall layout: header bar + content pane
+        # ── Header bar ───────────────────────────────────────────────
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
         header.set_title(APP_NAME)
         self.set_titlebar(header)
 
-        # Toolbar buttons in header
         btn_open = Gtk.Button.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON)
         btn_open.set_tooltip_text("Open file (Ctrl+O)")
         btn_open.connect("clicked", self._on_open_clicked)
@@ -427,7 +427,6 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._btn_next.connect("clicked", lambda *_: self._navigate(1))
         header.pack_start(self._btn_next)
 
-        # Zoom controls
         btn_zoom_out = Gtk.Button.new_from_icon_name("zoom-out-symbolic", Gtk.IconSize.BUTTON)
         btn_zoom_out.set_tooltip_text("Zoom out (-)")
         btn_zoom_out.connect("clicked", lambda *_: self._adjust_zoom(1 / 1.25))
@@ -448,10 +447,10 @@ class ImageViewer(Gtk.ApplicationWindow):
         btn_zoom_100.connect("clicked", lambda *_: self._zoom_actual())
         header.pack_end(btn_zoom_100)
 
-        btn_fs = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
-        btn_fs.set_tooltip_text("Fullscreen (F11)")
-        btn_fs.connect("clicked", lambda *_: self._toggle_fullscreen())
-        header.pack_end(btn_fs)
+        btn_fullscreen = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
+        btn_fullscreen.set_tooltip_text("Fullscreen (F11)")
+        btn_fullscreen.connect("clicked", lambda *_: self._toggle_fullscreen())
+        header.pack_end(btn_fullscreen)
 
         btn_exif = Gtk.ToggleButton()
         btn_exif.set_image(Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.BUTTON))
@@ -461,57 +460,64 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._btn_exif = btn_exif
         header.pack_end(btn_exif)
 
-        # Main horizontal pane: sidebar | image area
+        # ── Root paned: filesystem tree (left) | rest (right) ────────
         self._paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.add(self._paned)
 
-        # --- Sidebar ---
-        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        sidebar_label = Gtk.Label(label="Files")
-        sidebar_label.set_halign(Gtk.Align.START)
-        sidebar_label.get_style_context().add_class("caption")
+        # ── LEFT: Filesystem tree ─────────────────────────────────────
+        fs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        fs_label = Gtk.Label(label="Files")
+        fs_label.set_halign(Gtk.Align.START)
+        fs_label.set_margin_start(6)
+        fs_label.set_margin_top(4)
+        fs_label.set_margin_bottom(2)
 
-        scroll_side = Gtk.ScrolledWindow()
-        scroll_side.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll_side.set_min_content_width(170)
+        scroll_fs = Gtk.ScrolledWindow()
+        scroll_fs.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll_fs.set_min_content_width(200)
 
-        # ListStore: path (str), thumb (Pixbuf), name (str)
-        self._store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str)
+        # TreeStore columns: display_name, full_path, is_dir
+        self._fs_store = Gtk.TreeStore(str, str, bool)
+        self._fs_tree = Gtk.TreeView(model=self._fs_store)
+        self._fs_tree.set_headers_visible(False)
+        self._fs_tree.set_activate_on_single_click(True)
 
-        # TreeView virtualizes rows — only visible rows are rendered,
-        # so scrolling stays fast even with hundreds of files.
-        self._tree_view = Gtk.TreeView(model=self._store)
-        self._tree_view.set_headers_visible(False)
-        self._tree_view.set_activate_on_single_click(True)
+        fs_col = Gtk.TreeViewColumn()
+        fs_icon_cell = Gtk.CellRendererPixbuf()
+        fs_icon_cell.set_property("xpad", 2)
+        fs_text_cell = Gtk.CellRendererText()
+        fs_text_cell.set_property("ellipsize", 3)
+        fs_col.pack_start(fs_icon_cell, False)
+        fs_col.set_cell_data_func(fs_icon_cell, self._fs_icon_func)
+        fs_col.pack_start(fs_text_cell, True)
+        fs_col.add_attribute(fs_text_cell, "text", 0)
+        self._fs_tree.append_column(fs_col)
 
-        col = Gtk.TreeViewColumn()
-        pix_cell = Gtk.CellRendererPixbuf()
-        pix_cell.set_property("xpad", 3)
-        pix_cell.set_property("ypad", 3)
-        txt_cell = Gtk.CellRendererText()
-        txt_cell.set_property("ellipsize", 3)   # PANGO_ELLIPSIZE_END
-        txt_cell.set_property("width-chars", 12)
-        col.pack_start(pix_cell, False)
-        col.add_attribute(pix_cell, "pixbuf", 1)
-        col.pack_start(txt_cell, True)
-        col.add_attribute(txt_cell, "text", 2)
-        self._tree_view.append_column(col)
-        self._tree_view.connect("row-activated", self._on_thumb_activated)
+        self._fs_tree.connect("row-activated", self._on_fs_activated)
+        self._fs_tree.connect("test-expand-row", self._on_fs_expand)
 
-        scroll_side.add(self._tree_view)
-        sidebar_box.pack_start(sidebar_label, False, False, 4)
-        sidebar_box.pack_start(scroll_side, True, True, 0)
-        self._paned.pack1(sidebar_box, False, False)
-        self._paned.set_position(170)
+        scroll_fs.add(self._fs_tree)
+        fs_box.pack_start(fs_label, False, False, 0)
+        fs_box.pack_start(Gtk.Separator(), False, False, 0)
+        fs_box.pack_start(scroll_fs, True, True, 0)
+        self._paned.pack1(fs_box, False, False)
+        self._paned.set_position(220)
 
-        # --- Image area ---
+        # Populate filesystem tree roots
+        self._fs_populate_roots()
+
+        # ── RIGHT: vertical box = [content paned] + [thumb strip] ────
+        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        # ── Content paned: image view | EXIF panel ───────────────────
+        self._content_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+
+        # Image area
         image_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
-        # Scrolled window holding the image
         self._scroll = Gtk.ScrolledWindow()
         self._scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
-        # EventBox captures mouse events on the image
         self._event_box = Gtk.EventBox()
         self._event_box.add_events(
             Gdk.EventMask.SCROLL_MASK
@@ -531,17 +537,14 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._event_box.add(self._image_widget)
         self._scroll.add(self._event_box)
 
-        # Status bar
         self._statusbar = Gtk.Label(label="Open an image to get started  (Ctrl+O)")
         self._statusbar.set_halign(Gtk.Align.START)
         self._statusbar.set_margin_start(8)
         self._statusbar.set_margin_bottom(4)
-        self._statusbar.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        self._statusbar.set_ellipsize(3)
 
-        # Loading spinner overlay
         overlay = Gtk.Overlay()
         overlay.add(self._scroll)
-
         spinner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         spinner_box.set_halign(Gtk.Align.CENTER)
         spinner_box.set_valign(Gtk.Align.CENTER)
@@ -557,55 +560,75 @@ class ImageViewer(Gtk.ApplicationWindow):
         image_box.pack_start(Gtk.Separator(), False, False, 0)
         image_box.pack_start(self._statusbar, False, False, 0)
 
-        # --- EXIF panel (right side) ---
+        # EXIF panel
         exif_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-
-        exif_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         exif_title = Gtk.Label(label="EXIF")
         exif_title.set_halign(Gtk.Align.START)
         exif_title.set_margin_start(6)
         exif_title.set_margin_top(4)
         exif_title.set_margin_bottom(4)
-        exif_header.pack_start(exif_title, True, True, 0)
-        exif_outer.pack_start(exif_header, False, False, 0)
+        exif_outer.pack_start(exif_title, False, False, 0)
         exif_outer.pack_start(Gtk.Separator(), False, False, 0)
 
         scroll_exif = Gtk.ScrolledWindow()
         scroll_exif.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll_exif.set_min_content_width(200)
+        scroll_exif.set_min_content_width(210)
 
-        # Store: field (str), value (str), is_header (bool for bold)
         self._exif_store = Gtk.ListStore(str, str, bool)
         self._exif_view = Gtk.TreeView(model=self._exif_store)
         self._exif_view.set_headers_visible(False)
         self._exif_view.set_can_focus(False)
-
-        # Field column
         field_cell = Gtk.CellRendererText()
         field_cell.set_property("xpad", 6)
         field_cell.set_property("ypad", 2)
         field_col = Gtk.TreeViewColumn("Field", field_cell, text=0, weight_set=2)
         field_col.add_attribute(field_cell, "weight", 2)
         self._exif_view.append_column(field_col)
-
-        # Value column
         val_cell = Gtk.CellRendererText()
         val_cell.set_property("xpad", 6)
         val_cell.set_property("ypad", 2)
-        val_cell.set_property("ellipsize", 3)  # PANGO_ELLIPSIZE_END
+        val_cell.set_property("ellipsize", 3)
         val_col = Gtk.TreeViewColumn("Value", val_cell, text=1)
         val_col.set_expand(True)
         self._exif_view.append_column(val_col)
-
         scroll_exif.add(self._exif_view)
         exif_outer.pack_start(scroll_exif, True, True, 0)
 
-        # Right pane splits image | EXIF
-        self._right_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self._right_paned.pack1(image_box, True, True)
-        self._right_paned.pack2(exif_outer, False, False)
+        self._content_paned.pack1(image_box, True, True)
+        self._content_paned.pack2(exif_outer, False, False)
+        right_box.pack_start(self._content_paned, True, True, 0)
 
-        self._paned.pack2(self._right_paned, True, True)
+        # ── BOTTOM: Thumbnail strip ───────────────────────────────────
+        right_box.pack_start(Gtk.Separator(), False, False, 0)
+
+        thumb_strip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        thumb_label = Gtk.Label(label="Preview")
+        thumb_label.set_halign(Gtk.Align.START)
+        thumb_label.set_margin_start(6)
+        thumb_label.set_margin_top(2)
+        thumb_strip_box.pack_start(thumb_label, False, False, 0)
+
+        scroll_thumb = Gtk.ScrolledWindow()
+        scroll_thumb.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        scroll_thumb.set_min_content_height(ThumbnailLoader.THUMB_SIZE + 30)
+        scroll_thumb.set_max_content_height(ThumbnailLoader.THUMB_SIZE + 30)
+
+        # ListStore: path (str), thumb (Pixbuf), name (str)
+        self._store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str)
+        self._thumb_view = Gtk.IconView(model=self._store)
+        self._thumb_view.set_pixbuf_column(1)
+        self._thumb_view.set_text_column(2)
+        self._thumb_view.set_item_width(ThumbnailLoader.THUMB_SIZE + 10)
+        self._thumb_view.set_row_spacing(0)
+        self._thumb_view.set_column_spacing(2)
+        self._thumb_view.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._thumb_view.connect("item-activated", self._on_thumb_activated)
+
+        scroll_thumb.add(self._thumb_view)
+        thumb_strip_box.pack_start(scroll_thumb, False, False, 0)
+        right_box.pack_start(thumb_strip_box, False, False, 0)
+
+        self._paned.pack2(right_box, True, True)
 
         # Welcome screen placeholder
         self._show_placeholder()
@@ -613,8 +636,79 @@ class ImageViewer(Gtk.ApplicationWindow):
         self._spinner_box.hide()
 
     def _show_placeholder(self):
-        placeholder = Gtk.Image.new_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.DIALOG)
         self._image_widget.set_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.DIALOG)
+
+    # ------------------------------------------------------------------
+    # Filesystem tree
+    # ------------------------------------------------------------------
+
+    def _fs_populate_roots(self):
+        """Seed the tree with Home and common mount roots."""
+        roots = []
+        home = os.path.expanduser("~")
+        roots.append((os.path.basename(home) or "Home", home))
+        for candidate in ("/media", "/mnt", "/run/media"):
+            if os.path.isdir(candidate):
+                roots.append((candidate, candidate))
+        for name, path in roots:
+            it = self._fs_store.append(None, [name, path, True])
+            self._fs_store.append(it, ["", "", False])   # dummy child
+
+    def _fs_icon_func(self, col, cell, model, it, data):
+        is_dir = model.get_value(it, 2)
+        name   = model.get_value(it, 1)
+        ext    = os.path.splitext(name)[1].lower()
+        if is_dir:
+            icon = "folder-symbolic"
+        elif ext in SUPPORTED_EXTENSIONS:
+            icon = "image-x-generic-symbolic"
+        else:
+            icon = "text-x-generic-symbolic"
+        cell.set_property("icon-name", icon)
+
+    def _fs_load_dir(self, parent_iter, dir_path):
+        """Populate children of dir_path under parent_iter."""
+        if dir_path in self._fs_loaded_dirs:
+            return
+        self._fs_loaded_dirs.add(dir_path)
+
+        # Remove dummy placeholder
+        child = self._fs_store.iter_children(parent_iter)
+        while child:
+            next_child = self._fs_store.iter_next(child)
+            self._fs_store.remove(child)
+            child = next_child
+
+        try:
+            entries = sorted(os.scandir(dir_path), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except PermissionError:
+            return
+
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                it = self._fs_store.append(parent_iter, [entry.name, entry.path, True])
+                self._fs_store.append(it, ["", "", False])   # dummy child
+            elif os.path.splitext(entry.name)[1].lower() in SUPPORTED_EXTENSIONS:
+                self._fs_store.append(parent_iter, [entry.name, entry.path, False])
+
+    def _on_fs_expand(self, tree_view, parent_iter, tree_path):
+        dir_path = self._fs_store.get_value(parent_iter, 1)
+        self._fs_load_dir(parent_iter, dir_path)
+        return False   # allow the expansion
+
+    def _on_fs_activated(self, tree_view, tree_path, col):
+        it = self._fs_store.get_iter(tree_path)
+        path   = self._fs_store.get_value(it, 1)
+        is_dir = self._fs_store.get_value(it, 2)
+        if is_dir:
+            if tree_view.row_expanded(tree_path):
+                tree_view.collapse_row(tree_path)
+            else:
+                tree_view.expand_row(tree_path, False)
+        else:
+            self.open_file(path)
 
     # ------------------------------------------------------------------
     # Signal connections
@@ -745,7 +839,7 @@ class ImageViewer(Gtk.ApplicationWindow):
             self._store.set_value(it, 1, pixbuf)
         return False  # remove from idle
 
-    def _on_thumb_activated(self, tree_view, tree_path, column=None):
+    def _on_thumb_activated(self, icon_view, tree_path):
         it = self._store.get_iter(tree_path)
         path = self._store.get_value(it, 0)
         if path != self._current_path:
@@ -759,8 +853,8 @@ class ImageViewer(Gtk.ApplicationWindow):
         ref = self._thumb_path_to_row.get(path)
         if ref and ref.valid():
             tree_path = ref.get_path()
-            self._tree_view.get_selection().select_path(tree_path)
-            self._tree_view.scroll_to_cell(tree_path, None, True, 0.5, 0.0)
+            self._thumb_view.select_path(tree_path)
+            self._thumb_view.scroll_to_path(tree_path, False, 0.5, 0.5)
 
     # ------------------------------------------------------------------
     # Image loading (async)
@@ -984,7 +1078,7 @@ class ImageViewer(Gtk.ApplicationWindow):
             self._exif_store.append([field, value, BOLD if is_header else NORMAL])
 
     def _on_exif_toggle(self, btn):
-        _, exif_widget = self._right_paned.get_children()
+        _, exif_widget = self._content_paned.get_children()
         if btn.get_active():
             exif_widget.show()
         else:
