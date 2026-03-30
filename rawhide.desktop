@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Rawhide
+GenericName=Image Viewer
+Comment=View NEF, JPG, and PNG images including Nikon RAW files
+Exec=rawhide %F
+Icon=image-viewer
+Terminal=false
+Categories=Graphics;Viewer;Photography;
+MimeType=image/jpeg;image/png;image/x-nikon-nef;image/x-raw;
+Keywords=image;photo;viewer;raw;nef;nikon;jpg;jpeg;png;
+StartupNotify=true
+StartupWMClass=rawhide
