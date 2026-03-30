@@ -256,22 +256,36 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         scroll_side = Gtk.ScrolledWindow()
         scroll_side.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll_side.set_min_content_width(120)
+        scroll_side.set_min_content_width(170)
 
         # ListStore: path (str), thumb (Pixbuf), name (str)
         self._store = Gtk.ListStore(str, GdkPixbuf.Pixbuf, str)
-        self._icon_view = Gtk.IconView(model=self._store)
-        self._icon_view.set_pixbuf_column(1)
-        self._icon_view.set_text_column(2)
-        self._icon_view.set_item_width(110)
-        self._icon_view.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self._icon_view.connect("item-activated", self._on_thumb_activated)
 
-        scroll_side.add(self._icon_view)
+        # TreeView virtualizes rows — only visible rows are rendered,
+        # so scrolling stays fast even with hundreds of files.
+        self._tree_view = Gtk.TreeView(model=self._store)
+        self._tree_view.set_headers_visible(False)
+        self._tree_view.set_activate_on_single_click(True)
+
+        col = Gtk.TreeViewColumn()
+        pix_cell = Gtk.CellRendererPixbuf()
+        pix_cell.set_property("xpad", 3)
+        pix_cell.set_property("ypad", 3)
+        txt_cell = Gtk.CellRendererText()
+        txt_cell.set_property("ellipsize", 3)   # PANGO_ELLIPSIZE_END
+        txt_cell.set_property("width-chars", 12)
+        col.pack_start(pix_cell, False)
+        col.add_attribute(pix_cell, "pixbuf", 1)
+        col.pack_start(txt_cell, True)
+        col.add_attribute(txt_cell, "text", 2)
+        self._tree_view.append_column(col)
+        self._tree_view.connect("row-activated", self._on_thumb_activated)
+
+        scroll_side.add(self._tree_view)
         sidebar_box.pack_start(sidebar_label, False, False, 4)
         sidebar_box.pack_start(scroll_side, True, True, 0)
         self._paned.pack1(sidebar_box, False, False)
-        self._paned.set_position(130)
+        self._paned.set_position(170)
 
         # --- Image area ---
         image_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -466,7 +480,7 @@ class ImageViewer(Gtk.ApplicationWindow):
             self._store.set_value(it, 1, pixbuf)
         return False  # remove from idle
 
-    def _on_thumb_activated(self, icon_view, tree_path):
+    def _on_thumb_activated(self, tree_view, tree_path, column=None):
         it = self._store.get_iter(tree_path)
         path = self._store.get_value(it, 0)
         if path != self._current_path:
@@ -480,8 +494,8 @@ class ImageViewer(Gtk.ApplicationWindow):
         ref = self._thumb_path_to_row.get(path)
         if ref and ref.valid():
             tree_path = ref.get_path()
-            self._icon_view.select_path(tree_path)
-            self._icon_view.scroll_to_path(tree_path, False, 0.5, 0.5)
+            self._tree_view.get_selection().select_path(tree_path)
+            self._tree_view.scroll_to_cell(tree_path, None, True, 0.5, 0.0)
 
     # ------------------------------------------------------------------
     # Image loading (async)
