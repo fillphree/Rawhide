@@ -5,6 +5,7 @@ set -euo pipefail
 APP_NAME="rawhide"
 INSTALL_DIR="/usr/local/bin"
 APP_DIR="/usr/local/share/rawhide"
+VENV_DIR="$APP_DIR/venv"
 DESKTOP_DIR="/usr/local/share/applications"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,59 +32,69 @@ info "Installing Rawhide Image Viewer..."
 # ---------------------------------------------------------------
 info "Checking system packages..."
 PKGS=()
-for pkg in python3 python3-gi python3-gi-cairo python3-pip gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0 libgtk-3-0; do
+for pkg in python3 python3-full python3-gi python3-gi-cairo \
+           gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0 libgtk-3-0; do
     dpkg -s "$pkg" &>/dev/null || PKGS+=("$pkg")
 done
 
 if [[ ${#PKGS[@]} -gt 0 ]]; then
-    info "Installing: ${PKGS[*]}"
+    info "Installing system packages: ${PKGS[*]}"
     apt-get update -qq
     apt-get install -y "${PKGS[@]}"
 fi
 
-# Optional: libraw for better NEF support
+# Optional: libraw for better NEF compilation support
 if ! dpkg -s libraw-dev &>/dev/null 2>&1; then
     info "Installing libraw-dev for NEF support..."
-    apt-get install -y libraw-dev || warn "libraw-dev not available, rawpy may still work via bundled C library."
+    apt-get install -y libraw-dev || warn "libraw-dev not available — rawpy will use its bundled libraw."
 fi
 
 # ---------------------------------------------------------------
-# Python packages
+# Virtual environment
+# Newer Debian/Ubuntu (PEP 668) forbid pip install into the system
+# Python. We create an isolated venv under $APP_DIR instead.
+# The venv is configured with --system-site-packages so that the
+# system-installed PyGObject (python3-gi) remains available, since
+# it cannot be pip-installed on Debian.
 # ---------------------------------------------------------------
-info "Installing Python packages (rawpy, Pillow, numpy)..."
-pip3 install --quiet rawpy Pillow numpy
+info "Creating virtual environment at $VENV_DIR ..."
+mkdir -p "$APP_DIR"
+python3 -m venv --system-site-packages "$VENV_DIR"
+
+info "Installing Python packages into venv (rawpy, Pillow, numpy)..."
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+"$VENV_DIR/bin/pip" install --quiet rawpy Pillow numpy
 
 # ---------------------------------------------------------------
-# Install application files
+# Install application file
 # ---------------------------------------------------------------
 info "Copying application files..."
-mkdir -p "$APP_DIR"
 cp "$SCRIPT_DIR/rawhide.py" "$APP_DIR/rawhide.py"
 chmod 644 "$APP_DIR/rawhide.py"
 
-# Create launcher script
-cat > "$INSTALL_DIR/$APP_NAME" <<'LAUNCHER'
+# Launcher: explicitly call the venv Python so the correct packages
+# are found at runtime, regardless of the system default python3.
+cat > "$INSTALL_DIR/$APP_NAME" <<LAUNCHER
 #!/usr/bin/env bash
-exec python3 /usr/local/share/rawhide/rawhide.py "$@"
+exec "$VENV_DIR/bin/python3" "$APP_DIR/rawhide.py" "\$@"
 LAUNCHER
 chmod 755 "$INSTALL_DIR/$APP_NAME"
 
 # ---------------------------------------------------------------
 # Desktop file
 # ---------------------------------------------------------------
-if [[ -d "$DESKTOP_DIR" ]]; then
-    info "Installing .desktop entry..."
-    cp "$SCRIPT_DIR/rawhide.desktop" "$DESKTOP_DIR/rawhide.desktop"
-    chmod 644 "$DESKTOP_DIR/rawhide.desktop"
-    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+mkdir -p "$DESKTOP_DIR"
+info "Installing .desktop entry..."
+cp "$SCRIPT_DIR/rawhide.desktop" "$DESKTOP_DIR/rawhide.desktop"
+chmod 644 "$DESKTOP_DIR/rawhide.desktop"
+update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
-    # Register MIME types
-    if command -v xdg-mime &>/dev/null; then
-        xdg-mime default rawhide.desktop image/jpeg
-        xdg-mime default rawhide.desktop image/png
-        xdg-mime default rawhide.desktop image/x-nikon-nef
-        update-mime-database /usr/local/share/mime 2>/dev/null || true
-    fi
+# Register MIME types
+if command -v xdg-mime &>/dev/null; then
+    xdg-mime default rawhide.desktop image/jpeg
+    xdg-mime default rawhide.desktop image/png
+    xdg-mime default rawhide.desktop image/x-nikon-nef
+    update-mime-database /usr/local/share/mime 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------
